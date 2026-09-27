@@ -2,6 +2,9 @@ import os
 import time
 import json
 import tempfile
+import base64
+import io
+import trimesh
 from typing import List, Dict, Any
 from google import genai
 from google.genai import types
@@ -59,6 +62,7 @@ class Rendering(BaseModel):
 
 class Marketing(BaseModel):
     headline: str
+    description: str
     features: List[str]
 
 class DigitalTwin(BaseModel):
@@ -77,19 +81,21 @@ class Extracted3DModel(BaseModel):
     description: str
     obj_file_content: str
     recommended_texture_prompt: str
+    glb_base64: str = ""
 
 # ==========================================
 # PROMPTS
 # ==========================================
 SYSTEM_PROMPT_ANALYZE = """
-You are the core Spatial Reasoning and Market Valuation Engine for an AR e-commerce platform. Your objective is to ingest raw video and output a structured "Digital Twin" dataset.
+You are the core Spatial Reasoning, Market Valuation, and Research Engine for an AR e-commerce platform. Your objective is to ingest raw video of an object and output a structured "Digital Twin" dataset.
 
 ### DIRECTIVES:
-1. SPATIAL MEASUREMENT: Calculate real-world scale (Width, Height, Depth in cm). Look for anchors like hands (~18cm) or floor tiles (~30cm).
-2. CONDITION: Assign [Brand New, Excellent, Good, Fair, Poor] based on visual inspection.
-3. VALUATION: Estimate a Resale Price in USD based on brand and condition.
-4. 3D TEMPLATE: Map to closest template: ["tv", "chair", "laptop", "lamp", "sofa", "table", "sneaker", "generic_box"].
-5. MARKETING: 1-sentence headline and 3 bullet points of visual features.
+1. IDENTIFICATION & RESEARCH: Identify the exact product, brand, and model. Use your vast knowledge base to research its real-world specifications, history, and key selling points.
+2. SPATIAL MEASUREMENT: Calculate real-world scale (Width, Height, Depth in cm). Look for anchors like hands (~18cm) or floor tiles (~30cm). If you know the exact product, use its official dimensions.
+3. CONDITION: Assign [Mint / Unopened, Like New, Excellent, Good, Fair] based on visual inspection.
+4. VALUATION: Estimate a Resale Price in USD based on brand, exact model, current market value, and condition.
+5. 3D TEMPLATE: Map to closest template: ["tv", "chair", "laptop", "lamp", "sofa", "table", "sneaker", "generic_box"].
+6. MARKETING: Write a compelling 1-sentence headline, a detailed 2-paragraph description researching the item's history/specs, and 3-4 bullet points of visual features and researched facts about the item.
 """
 
 SYSTEM_PROMPT_3D_EXTRACT = """
@@ -135,7 +141,7 @@ async def analyze_video(product_hint: str = Form(...), video: UploadFile = File(
         user_prompt = f"Hint from seller: {product_hint}. Analyze video."
         
         response = client.models.generate_content(
-            model="gemini-1.5-flash",
+            model="gemini-1.5-pro",
             contents=[uploaded_file, user_prompt],
             config=types.GenerateContentConfig(
                 system_instruction=SYSTEM_PROMPT_ANALYZE,
@@ -188,7 +194,7 @@ async def extract_3d_model(video: UploadFile = File(...)) -> Any:
         user_prompt = "Analyze this video, extract the main object, and generate its 3D .obj representation."
         
         response = client.models.generate_content(
-            model="gemini-1.5-flash",
+            model="gemini-1.5-pro",
             contents=[uploaded_file, user_prompt],
             config=types.GenerateContentConfig(
                 system_instruction=SYSTEM_PROMPT_3D_EXTRACT,
@@ -199,7 +205,23 @@ async def extract_3d_model(video: UploadFile = File(...)) -> Any:
         )
         
         client.files.delete(name=uploaded_file.name)
-        return json.loads(response.text)
+        
+        response_data = json.loads(response.text)
+        obj_content = response_data.get("obj_file_content", "")
+        
+        glb_base64 = ""
+        if obj_content:
+            try:
+                print("Converting generated OBJ to GLB...")
+                mesh = trimesh.load(file_obj=io.BytesIO(obj_content.encode('utf-8')), file_type='obj', force='mesh')
+                glb_data = mesh.export(file_type='glb')
+                glb_base64 = base64.b64encode(glb_data).decode('utf-8')
+                print("Successfully converted to GLB.")
+            except Exception as e:
+                print(f"Failed to convert OBJ to GLB: {e}")
+                
+        response_data["glb_base64"] = glb_base64
+        return response_data
 
     except Exception as e:
         if "uploaded_file" in locals() and uploaded_file:
