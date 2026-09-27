@@ -1,265 +1,215 @@
-import os
-import time
+"""
+AuraMarket backend (FastAPI on Google Cloud Run).
+
+Endpoints
+---------
+GET  /           Service status and the Gemini models in use.
+GET  /health     Liveness probe.
+POST /scan       Frames sampled from the seller's video (or a short video file) plus an
+                 optional product hint. Responds with an NDJSON stream of progress
+                 events followed by one ``result`` (or ``error``) event.
+GET  /model.glb  Rebuilds a generated 3D model from its recipe token and target size
+                 in centimeters: ``/model.glb?v=1&w=72&h=80&d=70&r=<token>``.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import gzip
 import json
-import tempfile
-import base64
-import io
-import trimesh
-from typing import List, Dict, Any
-from google import genai
-from google.genai import types
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+import logging
+import os
+from collections.abc import AsyncIterator
+from functools import lru_cache
+from pathlib import Path
+
 from dotenv import load_dotenv
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response, StreamingResponse
+from google import genai
 
-# Load local .env file if it exists
-load_dotenv()
+import model_builder
+from media import MediaError, extract_frames, normalize_frame
+from pipeline import Event, PipelineConfig, ScanPipeline
 
-app = FastAPI(title="AuraMarket - Hackathon Backend")
+load_dotenv(Path(__file__).with_name(".env"))
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger("auramarket")
 
-# CRITICAL: Allow React frontend to communicate with this API
+# Upload limits. Cloud Run rejects HTTP/1 request bodies above 32 MiB, so raw videos must
+# stay below that; the web app normally sends ~20 small JPEG frames instead.
+MAX_FRAMES = 24
+MAX_FRAME_BYTES = 6 * 1024 * 1024
+MAX_VIDEO_BYTES = 30 * 1024 * 1024
+VIDEO_SAMPLE_FRAMES = 20
+MAX_HINT_CHARS = 200
+PING_INTERVAL_S = 10.0
+READ_CHUNK_BYTES = 1024 * 1024
+
+api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+if not api_key:
+    raise RuntimeError("GEMINI_API_KEY environment variable is missing!")
+
+pipeline = ScanPipeline(genai.Client(api_key=api_key), PipelineConfig.from_env())
+
+app = FastAPI(title="AuraMarket Backend", version="2.0.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], 
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "HEAD", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
-# Configure Gemini Client
-api_key = os.environ.get("GEMINI_API_KEY")
-if not api_key:
-    raise ValueError("GEMINI_API_KEY environment variable is missing!")
-client = genai.Client(api_key=api_key)
-
-# ==========================================
-# SCHEMAS FOR /analyze (Template Scaling)
-# ==========================================
-class Identification(BaseModel):
-    verified_name: str
-    brand: str
-
-class SpatialData(BaseModel):
-    width_cm: float
-    height_cm: float
-    depth_cm: float
-    anchors: str
-
-class MarketAnalysis(BaseModel):
-    condition: str
-    reasoning: str
-    price_usd: float
-
-class ScaleVector(BaseModel):
-    x: float
-    y: float
-    z: float
-
-class Rendering(BaseModel):
-    template_id: str
-    scale_vector: ScaleVector
-
-class Marketing(BaseModel):
-    headline: str
-    description: str
-    features: List[str]
-
-class DigitalTwin(BaseModel):
-    identification: Identification
-    spatial_data: SpatialData
-    market_analysis: MarketAnalysis
-    marketing: Marketing
-    rendering: Rendering
-
-# ==========================================
-# SCHEMAS FOR /extract-3d (Hybrid Approach)
-# ==========================================
-class Extracted3DModel(BaseModel):
-    """Response for the hybrid 3D extraction."""
-    object_name: str
-    description: str
-    obj_file_content: str
-    recommended_texture_prompt: str
-    glb_base64: str = ""
-
-# ==========================================
-# PROMPTS
-# ==========================================
-SYSTEM_PROMPT_ANALYZE = """
-You are the core Spatial Reasoning, Market Valuation, and Research Engine for an AR e-commerce platform. Your objective is to ingest raw video of an object and output a structured "Digital Twin" dataset.
-
-### DIRECTIVES:
-1. IDENTIFICATION & RESEARCH: Identify the exact product, brand, and model. Use your vast knowledge base to research its real-world specifications, history, and key selling points.
-2. SPATIAL MEASUREMENT: Calculate real-world scale (Width, Height, Depth in cm). Look for anchors like hands (~18cm) or floor tiles (~30cm). If you know the exact product, use its official dimensions.
-3. CONDITION: Assign [Mint / Unopened, Like New, Excellent, Good, Fair] based on visual inspection.
-4. VALUATION: Estimate a Resale Price in USD based on brand, exact model, current market value, and condition.
-5. 3D TEMPLATE: Map to closest template: ["tv", "chair", "laptop", "lamp", "sofa", "table", "sneaker", "generic_box"].
-6. MARKETING: Write a compelling 1-sentence headline, a detailed 2-paragraph description researching the item's history/specs, and 3-4 bullet points of visual features and researched facts about the item.
-"""
-
-SYSTEM_PROMPT_3D_EXTRACT = """
-You are a 3D modeling AI. Your objective is to analyze a video of an object and generate a low-poly 3D model representation of it.
-
-### DIRECTIVES:
-1. Identify the primary object in the video.
-2. Describe its shape and structure.
-3. Generate a valid .obj file string (using 'v' for vertices and 'f' for faces) that represents a low-poly approximation (e.g., a bounding box or basic geometric primitive) of the object's shape and proportions.
-4. Provide a highly detailed texture prompt that could be used by a text-to-image or text-to-3D texture generator to paint this model.
-"""
 
 @app.get("/")
-def health_check() -> Dict[str, str]:
-    return {"status": "AuraMarket Backend is running!"}
+def root() -> dict[str, object]:
+    """Service status and configured models."""
+    return {"status": "AuraMarket Backend is running!", "version": app.version, "models": pipeline.config.as_dict()}
 
-@app.post("/analyze")
-async def analyze_video(product_hint: str = Form(...), video: UploadFile = File(...)) -> Any:
+
+@app.get("/health")
+def health() -> dict[str, bool]:
+    """Liveness probe."""
+    return {"ok": True}
+
+
+async def _read_limited(upload: UploadFile, limit: int, label: str) -> bytes:
     """
-    Analyzes an uploaded video using Gemini 1.5 Flash to extract spatial dimensions,
-    market valuation, and 3D rendering data (Template Scaling Approach).
+    Read an upload into memory, rejecting it once it exceeds ``limit`` bytes.
+
+    Raises:
+        HTTPException: 413 when the file is too large.
     """
-    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=f"_{video.filename}")
-    temp_path = temp_file.name
-    
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await upload.read(READ_CHUNK_BYTES)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > limit:
+            raise HTTPException(status_code=413, detail=f"{label} is larger than {limit // (1024 * 1024)} MB.")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _encode_event(event: Event) -> bytes:
+    """Serialize one NDJSON line."""
+    return f"{json.dumps(event, ensure_ascii=False, separators=(',', ':'))}\n".encode("utf-8")
+
+
+async def _scan_stream(raw_frames: list[bytes], raw_video: bytes | None, video_name: str, hint: str) -> AsyncIterator[bytes]:
+    """
+    Run the pipeline in a background task and stream its events as NDJSON.
+
+    A ``ping`` line is sent whenever the pipeline is quiet for ``PING_INTERVAL_S`` so
+    proxies keep the connection open during the slower Gemini steps.
+    """
+    queue: asyncio.Queue[Event | None] = asyncio.Queue()
+
+    async def emit(event: Event) -> None:
+        await queue.put(event)
+
+    async def run() -> None:
+        try:
+            await emit({"type": "progress", "stage": "frames", "status": "running", "message": "Reading your video..."})
+            if raw_frames:
+                frames = await asyncio.to_thread(lambda: [normalize_frame(frame) for frame in raw_frames])
+            elif raw_video is not None:
+                frames = await asyncio.to_thread(extract_frames, raw_video, video_name, VIDEO_SAMPLE_FRAMES)
+            else:
+                raise MediaError("No video frames were uploaded.")
+            await emit({"type": "progress", "stage": "frames", "status": "done", "message": f"Using {len(frames)} frames from your video"})
+            await pipeline.run_scan(frames, hint, emit)
+        except MediaError as error:
+            await emit({"type": "progress", "stage": "frames", "status": "failed", "message": str(error)})
+            await emit({"type": "error", "stage": "frames", "message": str(error)})
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # noqa: BLE001 - report unexpected failures to the client instead of hanging
+            logger.exception("Scan crashed")
+            await emit({"type": "error", "stage": "internal", "message": f"Unexpected server error: {type(error).__name__}: {error}"})
+        finally:
+            await queue.put(None)
+
+    task = asyncio.create_task(run())
     try:
-        content = await video.read()
-        with open(temp_path, "wb") as f:
-            f.write(content)
-
-        print("Generating spatial data...")
-        user_prompt = f"Hint from seller: {product_hint}. Analyze video."
-        
-        # Check if it's a dummy video (size < 100 bytes)
-        file_size = os.path.getsize(temp_path)
-        if file_size < 100:
-            print("Dummy video detected. Using text-only prompt.")
-            response = client.models.generate_content(
-                model="gemini-1.5-pro",
-                contents=[user_prompt],
-                config=types.GenerateContentConfig(
-                    system_instruction=SYSTEM_PROMPT_ANALYZE,
-                    temperature=0.1,
-                    response_mime_type="application/json",
-                    response_schema=DigitalTwin,
-                )
-            )
-        else:
-            print(f"Uploading {video.filename} to Gemini...")
-            uploaded_file = client.files.upload(file=temp_path)
-
-            print("Waiting for video processing...")
-            while uploaded_file.state == "PROCESSING":
-                time.sleep(2)
-                uploaded_file = client.files.get(name=uploaded_file.name)
-                
-            if uploaded_file.state == "FAILED":
-                raise Exception("Gemini video processing failed.")
-
-            response = client.models.generate_content(
-                model="gemini-1.5-pro",
-                contents=[uploaded_file, user_prompt],
-                config=types.GenerateContentConfig(
-                    system_instruction=SYSTEM_PROMPT_ANALYZE,
-                    temperature=0.1,
-                    response_mime_type="application/json",
-                    response_schema=DigitalTwin,
-                )
-            )
-            client.files.delete(name=uploaded_file.name)
-            
-        return json.loads(response.text)
-
-    except Exception as e:
-        if "uploaded_file" in locals() and uploaded_file:
+        while True:
             try:
-                client.files.delete(name=uploaded_file.name)
-            except Exception:
-                pass
-        raise HTTPException(status_code=500, detail=str(e))
+                event = await asyncio.wait_for(queue.get(), timeout=PING_INTERVAL_S)
+            except asyncio.TimeoutError:
+                yield _encode_event({"type": "ping"})
+                continue
+            if event is None:
+                break
+            yield _encode_event(event)
     finally:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
+        # The client disconnected or the stream finished: never leave Gemini calls running.
+        if not task.done():
+            task.cancel()
 
-@app.post("/extract-3d")
-async def extract_3d_model(product_hint: str = Form(""), video: UploadFile = File(...)) -> Any:
-    """
-    Hybrid Approach: Extracts object details from video using Gemini
-    and generates a low-poly .obj 3D model representation directly.
-    """
-    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=f"_{video.filename}")
-    temp_path = temp_file.name
-    
+
+@app.post("/scan")
+async def scan(
+    frames: list[UploadFile] | None = File(default=None, description="JPEG/PNG frames sampled in order from the video."),
+    video: UploadFile | None = File(default=None, description="Alternative to frames: a video file up to 30 MB."),
+    product_hint: str = Form(default="", description="Optional seller description, e.g. 'Sony Bravia 55 inch TV'."),
+) -> StreamingResponse:
+    """Scan a video of an item: identify, research, photograph and model it in 3D."""
+    frame_uploads = frames or []
+    if not frame_uploads and video is None:
+        raise HTTPException(status_code=400, detail="Upload a video or frames from a video.")
+    if len(frame_uploads) > MAX_FRAMES:
+        raise HTTPException(status_code=400, detail=f"Send at most {MAX_FRAMES} frames.")
+
+    raw_frames = [await _read_limited(upload, MAX_FRAME_BYTES, "A frame") for upload in frame_uploads]
+    raw_frames = [frame for frame in raw_frames if frame]
+    raw_video: bytes | None = None
+    if not raw_frames:
+        if video is None:
+            raise HTTPException(status_code=400, detail="The uploaded frames were empty.")
+        raw_video = await _read_limited(video, MAX_VIDEO_BYTES, "The video")
+        if not raw_video:
+            raise HTTPException(status_code=400, detail="The uploaded video was empty.")
+
+    hint = " ".join(product_hint.split())[:MAX_HINT_CHARS]
+    video_name = (video.filename or "") if video is not None else ""
+    return StreamingResponse(
+        _scan_stream(raw_frames, raw_video, video_name, hint),
+        media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@lru_cache(maxsize=64)
+def _gzipped_glb(token: str, target: model_builder.Vec3 | None) -> bytes:
+    """Gzip a built GLB once per unique URL (GLB geometry compresses by roughly half)."""
+    return gzip.compress(model_builder.build_glb_from_token(token, target), compresslevel=6)
+
+
+@app.api_route("/model.glb", methods=["GET", "HEAD"])
+def model_glb(
+    request: Request,
+    r: str = Query(..., min_length=1, max_length=model_builder.MAX_TOKEN_CHARS, description="Recipe token from /scan."),
+    w: float | None = Query(default=None, description="Target width in cm."),
+    h: float | None = Query(default=None, description="Target height in cm."),
+    d: float | None = Query(default=None, description="Target depth in cm."),
+) -> Response:
+    """Serve a generated model. Identical URLs always return identical bytes, so they are cached for a year."""
     try:
-        content = await video.read()
-        with open(temp_path, "wb") as f:
-            f.write(content)
+        target = model_builder.parse_target_dimensions(w, h, d)
+        accepts_gzip = "gzip" in request.headers.get("accept-encoding", "").lower()
+        body = _gzipped_glb(r, target) if accepts_gzip else model_builder.build_glb_from_token(r, target)
+    except model_builder.RecipeError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
 
-        print("Generating 3D model data...")
-        user_prompt = f"Analyze this video, extract the main object (Hint: {product_hint}), and generate its 3D .obj representation."
-        
-        # Check if it's a dummy video (size < 100 bytes)
-        file_size = os.path.getsize(temp_path)
-        if file_size < 100:
-            print("Dummy video detected. Using text-only prompt for 3D generation.")
-            user_prompt = f"Generate a 3D .obj representation of this object: {product_hint}."
-            response = client.models.generate_content(
-                model="gemini-1.5-pro",
-                contents=[user_prompt],
-                config=types.GenerateContentConfig(
-                    system_instruction=SYSTEM_PROMPT_3D_EXTRACT,
-                    temperature=0.2,
-                    response_mime_type="application/json",
-                    response_schema=Extracted3DModel,
-                )
-            )
-        else:
-            print(f"Uploading {video.filename} to Gemini for 3D extraction...")
-            uploaded_file = client.files.upload(file=temp_path)
-
-            print("Waiting for video processing...")
-            while uploaded_file.state == "PROCESSING":
-                time.sleep(2)
-                uploaded_file = client.files.get(name=uploaded_file.name)
-                
-            if uploaded_file.state == "FAILED":
-                raise Exception("Gemini video processing failed.")
-
-            response = client.models.generate_content(
-                model="gemini-1.5-pro",
-                contents=[uploaded_file, user_prompt],
-                config=types.GenerateContentConfig(
-                    system_instruction=SYSTEM_PROMPT_3D_EXTRACT,
-                    temperature=0.2,
-                    response_mime_type="application/json",
-                    response_schema=Extracted3DModel,
-                )
-            )
-            client.files.delete(name=uploaded_file.name)
-        
-        response_data = json.loads(response.text)
-        obj_content = response_data.get("obj_file_content", "")
-        
-        glb_base64 = ""
-        if obj_content:
-            try:
-                print("Converting generated OBJ to GLB...")
-                mesh = trimesh.load(file_obj=io.BytesIO(obj_content.encode('utf-8')), file_type='obj', force='mesh')
-                glb_data = mesh.export(file_type='glb')
-                glb_base64 = base64.b64encode(glb_data).decode('utf-8')
-                print("Successfully converted to GLB.")
-            except Exception as e:
-                print(f"Failed to convert OBJ to GLB: {e}")
-                
-        response_data["glb_base64"] = glb_base64
-        return response_data
-
-    except Exception as e:
-        if "uploaded_file" in locals() and uploaded_file:
-            try:
-                client.files.delete(name=uploaded_file.name)
-            except Exception:
-                pass
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
+    headers = {
+        "Cache-Control": "public, max-age=31536000, immutable",
+        "Vary": "Accept-Encoding",
+        "Content-Disposition": 'inline; filename="model.glb"',
+    }
+    if accepts_gzip:
+        headers["Content-Encoding"] = "gzip"
+    return Response(content=body, media_type="model/gltf-binary", headers=headers)
