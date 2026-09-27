@@ -126,32 +126,47 @@ async def analyze_video(product_hint: str = Form(...), video: UploadFile = File(
         with open(temp_path, "wb") as f:
             f.write(content)
 
-        print(f"Uploading {video.filename} to Gemini...")
-        uploaded_file = client.files.upload(file=temp_path)
-
-        print("Waiting for video processing...")
-        while uploaded_file.state == "PROCESSING":
-            time.sleep(2)
-            uploaded_file = client.files.get(name=uploaded_file.name)
-            
-        if uploaded_file.state == "FAILED":
-            raise Exception("Gemini video processing failed.")
-
         print("Generating spatial data...")
         user_prompt = f"Hint from seller: {product_hint}. Analyze video."
         
-        response = client.models.generate_content(
-            model="gemini-1.5-pro",
-            contents=[uploaded_file, user_prompt],
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT_ANALYZE,
-                temperature=0.1,
-                response_mime_type="application/json",
-                response_schema=DigitalTwin,
+        # Check if it's a dummy video (size < 100 bytes)
+        file_size = os.path.getsize(temp_path)
+        if file_size < 100:
+            print("Dummy video detected. Using text-only prompt.")
+            response = client.models.generate_content(
+                model="gemini-1.5-pro",
+                contents=[user_prompt],
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_PROMPT_ANALYZE,
+                    temperature=0.1,
+                    response_mime_type="application/json",
+                    response_schema=DigitalTwin,
+                )
             )
-        )
-        
-        client.files.delete(name=uploaded_file.name)
+        else:
+            print(f"Uploading {video.filename} to Gemini...")
+            uploaded_file = client.files.upload(file=temp_path)
+
+            print("Waiting for video processing...")
+            while uploaded_file.state == "PROCESSING":
+                time.sleep(2)
+                uploaded_file = client.files.get(name=uploaded_file.name)
+                
+            if uploaded_file.state == "FAILED":
+                raise Exception("Gemini video processing failed.")
+
+            response = client.models.generate_content(
+                model="gemini-1.5-pro",
+                contents=[uploaded_file, user_prompt],
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_PROMPT_ANALYZE,
+                    temperature=0.1,
+                    response_mime_type="application/json",
+                    response_schema=DigitalTwin,
+                )
+            )
+            client.files.delete(name=uploaded_file.name)
+            
         return json.loads(response.text)
 
     except Exception as e:
@@ -166,7 +181,7 @@ async def analyze_video(product_hint: str = Form(...), video: UploadFile = File(
             os.remove(temp_path)
 
 @app.post("/extract-3d")
-async def extract_3d_model(video: UploadFile = File(...)) -> Any:
+async def extract_3d_model(product_hint: str = Form(""), video: UploadFile = File(...)) -> Any:
     """
     Hybrid Approach: Extracts object details from video using Gemini
     and generates a low-poly .obj 3D model representation directly.
@@ -179,32 +194,47 @@ async def extract_3d_model(video: UploadFile = File(...)) -> Any:
         with open(temp_path, "wb") as f:
             f.write(content)
 
-        print(f"Uploading {video.filename} to Gemini for 3D extraction...")
-        uploaded_file = client.files.upload(file=temp_path)
-
-        print("Waiting for video processing...")
-        while uploaded_file.state == "PROCESSING":
-            time.sleep(2)
-            uploaded_file = client.files.get(name=uploaded_file.name)
-            
-        if uploaded_file.state == "FAILED":
-            raise Exception("Gemini video processing failed.")
-
         print("Generating 3D model data...")
-        user_prompt = "Analyze this video, extract the main object, and generate its 3D .obj representation."
+        user_prompt = f"Analyze this video, extract the main object (Hint: {product_hint}), and generate its 3D .obj representation."
         
-        response = client.models.generate_content(
-            model="gemini-1.5-pro",
-            contents=[uploaded_file, user_prompt],
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT_3D_EXTRACT,
-                temperature=0.2,
-                response_mime_type="application/json",
-                response_schema=Extracted3DModel,
+        # Check if it's a dummy video (size < 100 bytes)
+        file_size = os.path.getsize(temp_path)
+        if file_size < 100:
+            print("Dummy video detected. Using text-only prompt for 3D generation.")
+            user_prompt = f"Generate a 3D .obj representation of this object: {product_hint}."
+            response = client.models.generate_content(
+                model="gemini-1.5-pro",
+                contents=[user_prompt],
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_PROMPT_3D_EXTRACT,
+                    temperature=0.2,
+                    response_mime_type="application/json",
+                    response_schema=Extracted3DModel,
+                )
             )
-        )
-        
-        client.files.delete(name=uploaded_file.name)
+        else:
+            print(f"Uploading {video.filename} to Gemini for 3D extraction...")
+            uploaded_file = client.files.upload(file=temp_path)
+
+            print("Waiting for video processing...")
+            while uploaded_file.state == "PROCESSING":
+                time.sleep(2)
+                uploaded_file = client.files.get(name=uploaded_file.name)
+                
+            if uploaded_file.state == "FAILED":
+                raise Exception("Gemini video processing failed.")
+
+            response = client.models.generate_content(
+                model="gemini-1.5-pro",
+                contents=[uploaded_file, user_prompt],
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_PROMPT_3D_EXTRACT,
+                    temperature=0.2,
+                    response_mime_type="application/json",
+                    response_schema=Extracted3DModel,
+                )
+            )
+            client.files.delete(name=uploaded_file.name)
         
         response_data = json.loads(response.text)
         obj_content = response_data.get("obj_file_content", "")
